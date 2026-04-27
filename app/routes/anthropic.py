@@ -1,47 +1,55 @@
 """Anthropic Messages API /v1/messages — stream + non-stream."""
 from __future__ import annotations
 
+import asyncio
 import json
-import time
+import logging
 import uuid
 from typing import Any, AsyncIterator, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict
 
-from app.config import PROXY_API_KEY
+from app.routes.auth import require_any_key
 from app.deepseek import files as ds_files
-from app.deepseek import sessions
 from app.deepseek.client import DeepSeekClient
 from app.routes.openai_chat import (
-    flatten_prefix,
+    build_cache_text,
+    parse_model,
     prepend_system,
     resolve_session,
     _cache_turn,
 )
 from app.tools.inject import normalize_anthropic_tools, tool_system_block
-from app.tools.parser import ToolCallParser
+from app.tools.parser import CLOSE as TOOL_CLOSE, OPEN as TOOL_OPEN, ToolCallParser
 from app.tools.prune import prune_tool_result
 
 router = APIRouter()
+log = logging.getLogger(__name__)
+
+PING_INTERVAL = 5.0
 
 
 def _estimate_tokens(text: str) -> int:
-    # Rough 1 token ≈ 4 chars; good enough for Claude Code usage display.
+    # Rough 1 token ≈ 4 chars; good enough for Claude Code's usage display.
+    # Neither DeepSeek nor Z.AI exposes a tokenizer so the bar is always an
+    # approximation — slightly under-counts code/JSON, slightly over-counts prose.
     if not text:
         return 0
     return max(1, len(text) // 4)
 
 
-def _require_key(request: Request):
-    if not PROXY_API_KEY:
-        return
-    got = request.headers.get("x-api-key") or request.headers.get(
-        "authorization", ""
-    ).removeprefix("Bearer ").strip()
-    if got != PROXY_API_KEY:
-        raise HTTPException(401, "invalid api key")
+def _estimate_input_tokens(turns: list[tuple[str, str]], tools: list[dict] | None) -> int:
+    """Estimate the FULL input token cost (history + tools), not just the new
+    prompt. Claude Code's usage bar reads `input_tokens` so reporting only the
+    last user turn after a cache hit makes the bar swing wildly."""
+    body = "\n\n".join(t for _, t in turns)
+    tools_text = json.dumps(tools or []) if tools else ""
+    return _estimate_tokens(body) + _estimate_tokens(tools_text)
+
+
+_require_key = require_any_key
 
 
 # ---- schema ----
@@ -90,9 +98,9 @@ def _flatten_block(block: dict) -> str:
         return block.get("text", "")
     if t == "tool_use":
         return (
-            f"<tool_call>\n"
+            f"{TOOL_OPEN}\n"
             f"{json.dumps({'name': block.get('name', ''), 'arguments': block.get('input', {})})}"
-            f"\n</tool_call>"
+            f"\n{TOOL_CLOSE}"
         )
     if t == "tool_result":
         content = block.get("content", "")
@@ -162,8 +170,11 @@ def _anthropic_to_turns(req: AnthropicRequest) -> list[tuple[str, str]]:
 
 # ---- SSE helpers ----
 
+_JSON_SEPS = (",", ":")
+
+
 def _sse(event: str, data: dict) -> bytes:
-    return f"event: {event}\ndata: {json.dumps(data, separators=(',', ':'))}\n\n".encode()
+    return f"event: {event}\ndata: {json.dumps(data, separators=_JSON_SEPS)}\n\n".encode()
 
 
 @router.post("/v1/messages/count_tokens")
@@ -178,11 +189,17 @@ async def count_tokens(req: AnthropicRequest, _: None = Depends(_require_key)):
 
 @router.post("/v1/messages")
 async def messages(req: AnthropicRequest, request: Request, _: None = Depends(_require_key)):
-    # Search: :search suffix on model name; thinking: client-requested or reasoner model
-    search = req.model.endswith(":search")
-    base_model = req.model[:-len(":search")] if search else req.model
-    is_reasoner = "reasoner" in base_model or "thinking" in base_model or "opus" in base_model
-    thinking_enabled = bool(req.thinking and req.thinking.get("type") == "enabled") or is_reasoner
+    # Reuse shared suffix parser (handles :search, :think, :nothink, MCP aliases)
+    base_model, thinking_enabled, search, mcp_servers = parse_model(req.model)
+    # Anthropic thinking param and model-name heuristics override parse_model defaults.
+    # Check against the RAW model name since Claude Code sends model strings like
+    # "claude-3-opus" that parse_model canonicalizes away to "deepseek-chat".
+    model_lower = req.model.lower()
+    is_reasoner = "reasoner" in model_lower or "thinking" in model_lower or "opus" in model_lower
+    if req.thinking and req.thinking.get("type") == "enabled":
+        thinking_enabled = True
+    elif is_reasoner:
+        thinking_enabled = True
 
     turns = _anthropic_to_turns(req)
 
@@ -241,11 +258,13 @@ async def messages(req: AnthropicRequest, request: Request, _: None = Depends(_r
     ref_file_ids = await _collect_ref_files(req)
     has_tools = bool(tools_norm)
 
+    input_tokens = _estimate_input_tokens(turns, req.tools)
     if req.stream:
         return StreamingResponse(
             _stream_anthropic(
                 client, session_id, parent_id, turns, prompt, thinking_enabled, search,
-                req.model, has_tools, ref_file_ids,
+                req.model, has_tools, ref_file_ids, base_model, mcp_servers,
+                input_tokens,
             ),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
@@ -253,7 +272,8 @@ async def messages(req: AnthropicRequest, request: Request, _: None = Depends(_r
     return JSONResponse(
         await _buffered_anthropic(
             client, session_id, parent_id, turns, prompt, thinking_enabled, search,
-            req.model, has_tools, ref_file_ids,
+            req.model, has_tools, ref_file_ids, base_model, mcp_servers,
+            input_tokens,
         )
     )
 
@@ -261,7 +281,7 @@ async def messages(req: AnthropicRequest, request: Request, _: None = Depends(_r
 async def _stream_anthropic(
     client: DeepSeekClient,
     session_id: str,
-    parent_id: int | None,
+    parent_id: int | str | None,
     turns: list[tuple[str, str]],
     prompt: str,
     thinking: bool,
@@ -269,9 +289,11 @@ async def _stream_anthropic(
     model: str,
     has_tools: bool,
     ref_file_ids: list[str] | None = None,
+    base_model: str | None = None,
+    mcp_servers: list[str] | None = None,
+    input_tokens: int = 0,
 ) -> AsyncIterator[bytes]:
     msg_id = f"msg_{uuid.uuid4().hex[:24]}"
-    input_tokens = _estimate_tokens(prompt)
     yield _sse(
         "message_start",
         {
@@ -293,11 +315,7 @@ async def _stream_anthropic(
             },
         },
     )
-    # Anthropic clients expect periodic `ping` events to keep the connection
-    # alive during long reasoner waits. One right after start + a background
-    # beat every ~10s.
     yield _sse("ping", {"type": "ping"})
-    last_ping = time.time()
 
     parser = ToolCallParser() if has_tools else None
     block_idx = -1
@@ -306,6 +324,7 @@ async def _stream_anthropic(
     tool_calls: list[dict] = []
     stop_reason = "end_turn"
     final_msg_id: int | None = None
+    final_session_id: str = session_id
 
     def open_block(kind: str, extra: dict) -> bytes:
         nonlocal block_idx, current_block
@@ -324,149 +343,221 @@ async def _stream_anthropic(
         current_block = None
         return out
 
+    # Drive the upstream stream from a background task and feed events through
+    # a queue. This lets us emit `ping` heartbeats independently of upstream
+    # liveness — critical because PoW solve, session creation, and prefix
+    # compression all happen inside `stream_completion()` BEFORE the first
+    # upstream byte arrives. Without an out-of-band ping the SSE channel goes
+    # silent for 30-90s on big tasks and Claude Code aborts the request.
+    queue: asyncio.Queue = asyncio.Queue()
+
+    async def _producer() -> None:
+        try:
+            async for ev in client.stream_completion(
+                session_id=session_id,
+                prompt=prompt,
+                parent_message_id=parent_id,
+                thinking=thinking,
+                search=search,
+                ref_file_ids=ref_file_ids,
+                model=base_model,
+                mcp_servers=mcp_servers,
+            ):
+                await queue.put(("ev", ev))
+        except Exception as e:  # surfaced to the consumer as a visible error
+            log.warning("anthropic stream upstream error: %s", e)
+            await queue.put(("err", str(e)))
+        finally:
+            await queue.put(("end", None))
+
+    producer = asyncio.create_task(_producer())
+    pending_get: asyncio.Task | None = None
+
     try:
-        async for ev in client.stream_completion(
-            session_id=session_id,
-            prompt=prompt,
-            parent_message_id=parent_id,
-            thinking=thinking,
-            search=search,
-            ref_file_ids=ref_file_ids,
-        ):
-            if ev["type"] == "thinking":
-                if current_block != "thinking":
-                    if current_block:
-                        yield close_block()
-                    yield open_block("thinking", {"type": "thinking", "thinking": ""})
-                yield _sse(
-                    "content_block_delta",
-                    {
-                        "type": "content_block_delta",
-                        "index": block_idx,
-                        "delta": {"type": "thinking_delta", "thinking": ev["text"]},
-                    },
-                )
-                continue
-            if ev["type"] == "done":
-                final_msg_id = ev.get("message_id")
-                if parser:
-                    for pev in parser.flush():
-                        if pev["type"] == "text":
-                            if current_block != "text":
-                                if current_block:
-                                    yield close_block()
-                                yield open_block("text", {"type": "text", "text": ""})
-                            assistant_buf.append(pev["text"])
-                            yield _sse(
-                                "content_block_delta",
-                                {
-                                    "type": "content_block_delta",
-                                    "index": block_idx,
-                                    "delta": {"type": "text_delta", "text": pev["text"]},
-                                },
-                            )
+      while True:
+        if pending_get is None:
+            pending_get = asyncio.create_task(queue.get())
+        try:
+            kind, val = await asyncio.wait_for(
+                asyncio.shield(pending_get), timeout=PING_INTERVAL
+            )
+            pending_get = None
+        except asyncio.TimeoutError:
+            yield _sse("ping", {"type": "ping"})
+            continue
+
+        if kind == "end":
+            # Producer finished without an explicit `done` event (e.g. after
+            # an err frame, or upstream closed early). Wrap up gracefully.
+            if current_block:
+                yield close_block()
+            output_tokens = _estimate_tokens("".join(assistant_buf))
+            yield _sse(
+                "message_delta",
+                {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+                    "usage": {"output_tokens": output_tokens},
+                },
+            )
+            yield _sse("message_stop", {"type": "message_stop"})
+            break
+
+        if kind == "err":
+            # Make the failure visible inside the response instead of leaving
+            # Claude Code with a blank turn after a silent abort.
+            if current_block and current_block != "text":
+                yield close_block()
+            if current_block != "text":
+                yield open_block("text", {"type": "text", "text": ""})
+            err_text = f"\n\n[proxy: upstream error: {val}]"
+            assistant_buf.append(err_text)
+            yield _sse(
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": block_idx,
+                    "delta": {"type": "text_delta", "text": err_text},
+                },
+            )
+            # also surface the raw error event for SDKs that key on it
+            yield _sse(
+                "error",
+                {"type": "error", "error": {"type": "upstream_error", "message": str(val)}},
+            )
+            continue  # producer will follow with `end`
+
+        ev = val
+        if ev["type"] == "thinking":
+            if current_block != "thinking":
                 if current_block:
                     yield close_block()
-                if tool_calls:
-                    stop_reason = "tool_use"
-                output_tokens = _estimate_tokens("".join(assistant_buf))
-                yield _sse(
-                    "message_delta",
-                    {
-                        "type": "message_delta",
-                        "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-                        "usage": {"output_tokens": output_tokens},
-                    },
-                )
-                yield _sse("message_stop", {"type": "message_stop"})
-                break
-            if ev["type"] != "content":
-                # Keep connection warm on search_status / idle frames.
-                now_t = time.time()
-                if now_t - last_ping > 10:
-                    last_ping = now_t
-                    yield _sse("ping", {"type": "ping"})
-                continue
-            now_t = time.time()
-            if now_t - last_ping > 10:
-                last_ping = now_t
-                yield _sse("ping", {"type": "ping"})
+                yield open_block("thinking", {"type": "thinking", "thinking": ""})
+            yield _sse(
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": block_idx,
+                    "delta": {"type": "thinking_delta", "thinking": ev["text"]},
+                },
+            )
+            continue
+        if ev["type"] == "done":
+            final_msg_id = ev.get("message_id")
+            final_session_id = ev.get("session_id") or session_id
+            if parser:
+                for pev in parser.flush():
+                    if pev["type"] == "text":
+                        if current_block != "text":
+                            if current_block:
+                                yield close_block()
+                            yield open_block("text", {"type": "text", "text": ""})
+                        assistant_buf.append(pev["text"])
+                        yield _sse(
+                            "content_block_delta",
+                            {
+                                "type": "content_block_delta",
+                                "index": block_idx,
+                                "delta": {"type": "text_delta", "text": pev["text"]},
+                            },
+                        )
+            if current_block:
+                yield close_block()
+            if tool_calls:
+                stop_reason = "tool_use"
+            output_tokens = _estimate_tokens("".join(assistant_buf))
+            yield _sse(
+                "message_delta",
+                {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+                    "usage": {"output_tokens": output_tokens},
+                },
+            )
+            yield _sse("message_stop", {"type": "message_stop"})
+            cache_text = build_cache_text("".join(assistant_buf), tool_calls)
+            await _cache_turn(turns, cache_text, final_session_id, final_msg_id)
+            break
+        if ev["type"] != "content":
+            continue
 
-            text = ev["text"]
-            if not parser:
+        text = ev["text"]
+        if not parser:
+            if current_block == "thinking":
+                yield close_block()
+            if current_block != "text":
+                yield open_block("text", {"type": "text", "text": ""})
+            assistant_buf.append(text)
+            yield _sse(
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": block_idx,
+                    "delta": {"type": "text_delta", "text": text},
+                },
+            )
+            continue
+
+        for pev in parser.feed(text):
+            if pev["type"] == "text":
                 if current_block == "thinking":
                     yield close_block()
                 if current_block != "text":
                     yield open_block("text", {"type": "text", "text": ""})
-                assistant_buf.append(text)
+                assistant_buf.append(pev["text"])
                 yield _sse(
                     "content_block_delta",
                     {
                         "type": "content_block_delta",
                         "index": block_idx,
-                        "delta": {"type": "text_delta", "text": text},
+                        "delta": {"type": "text_delta", "text": pev["text"]},
                     },
                 )
-                continue
-
-            for pev in parser.feed(text):
-                if pev["type"] == "text":
-                    if current_block == "thinking":
-                        yield close_block()
-                    if current_block != "text":
-                        yield open_block("text", {"type": "text", "text": ""})
-                    assistant_buf.append(pev["text"])
-                    yield _sse(
-                        "content_block_delta",
-                        {
-                            "type": "content_block_delta",
-                            "index": block_idx,
-                            "delta": {"type": "text_delta", "text": pev["text"]},
+            elif pev["type"] == "tool_call_start":
+                if current_block:
+                    yield close_block()
+                yield open_block(
+                    "tool_use",
+                    {
+                        "type": "tool_use",
+                        "id": pev["id"],
+                        "name": pev["name"],
+                        "input": {},
+                    },
+                )
+            elif pev["type"] == "tool_call_arg_delta":
+                if current_block != "tool_use":
+                    continue
+                yield _sse(
+                    "content_block_delta",
+                    {
+                        "type": "content_block_delta",
+                        "index": block_idx,
+                        "delta": {
+                            "type": "input_json_delta",
+                            "partial_json": pev["delta"],
                         },
-                    )
-                elif pev["type"] == "tool_call_start":
-                    if current_block:
-                        yield close_block()
-                    yield open_block(
-                        "tool_use",
-                        {
-                            "type": "tool_use",
-                            "id": pev["id"],
-                            "name": pev["name"],
-                            "input": {},
-                        },
-                    )
-                elif pev["type"] == "tool_call_arg_delta":
-                    if current_block != "tool_use":
-                        continue
-                    yield _sse(
-                        "content_block_delta",
-                        {
-                            "type": "content_block_delta",
-                            "index": block_idx,
-                            "delta": {
-                                "type": "input_json_delta",
-                                "partial_json": pev["delta"],
-                            },
-                        },
-                    )
-                elif pev["type"] == "tool_call_end":
-                    if current_block == "tool_use":
-                        yield close_block()
-                    tool_calls.append(pev)
-    except Exception as e:
-        yield _sse(
-            "error",
-            {"type": "error", "error": {"type": "upstream_error", "message": str(e)}},
-        )
-    else:
-        await _cache_turn(turns, "".join(assistant_buf), session_id, final_msg_id)
+                    },
+                )
+            elif pev["type"] == "tool_call_end":
+                if current_block == "tool_use":
+                    yield close_block()
+                tool_calls.append(pev)
+    finally:
+        if pending_get is not None and not pending_get.done():
+            pending_get.cancel()
+        if not producer.done():
+            producer.cancel()
+        try:
+            await producer
+        except (asyncio.CancelledError, Exception):
+            pass
 
 
 async def _buffered_anthropic(
     client: DeepSeekClient,
     session_id: str,
-    parent_id: int | None,
+    parent_id: int | str | None,
     turns: list[tuple[str, str]],
     prompt: str,
     thinking: bool,
@@ -474,11 +565,15 @@ async def _buffered_anthropic(
     model: str,
     has_tools: bool,
     ref_file_ids: list[str] | None = None,
+    base_model: str | None = None,
+    mcp_servers: list[str] | None = None,
+    input_tokens: int = 0,
 ) -> dict:
     content_parts: list[str] = []
     thinking_parts: list[str] = []
     tool_calls: list[dict] = []
-    message_id: int | None = None
+    message_id: int | str | None = None
+    final_session_id: str = session_id
     parser = ToolCallParser() if has_tools else None
 
     async for ev in client.stream_completion(
@@ -488,6 +583,8 @@ async def _buffered_anthropic(
         thinking=thinking,
         search=search,
         ref_file_ids=ref_file_ids,
+        model=base_model,
+        mcp_servers=mcp_servers,
     ):
         if ev["type"] == "thinking":
             thinking_parts.append(ev["text"])
@@ -502,6 +599,7 @@ async def _buffered_anthropic(
                         tool_calls.append(pev)
         elif ev["type"] == "done":
             message_id = ev["message_id"]
+            final_session_id = ev.get("session_id") or session_id
             break
     if parser:
         for pev in parser.flush():
@@ -509,7 +607,8 @@ async def _buffered_anthropic(
                 content_parts.append(pev["text"])
 
     content = "".join(content_parts)
-    await _cache_turn(turns, content, session_id, message_id)
+    cache_text = build_cache_text(content, tool_calls)
+    await _cache_turn(turns, cache_text, final_session_id, message_id)
 
     blocks: list[dict] = []
     if thinking_parts:
@@ -521,7 +620,6 @@ async def _buffered_anthropic(
             {"type": "tool_use", "id": tc["id"], "name": tc["name"], "input": tc["arguments"]}
         )
 
-    input_tokens = _estimate_tokens(prompt)
     output_tokens = _estimate_tokens(content) + _estimate_tokens("".join(thinking_parts))
     return {
         "id": f"msg_{uuid.uuid4().hex[:24]}",

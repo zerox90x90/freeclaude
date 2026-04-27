@@ -6,18 +6,13 @@ import uuid
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 
-from app.config import PROXY_API_KEY
+from app.config import BACKEND
 from app.deepseek import files as ds_files
+from app.routes.auth import require_bearer_key
 
 router = APIRouter()
 
-
-def _require_key(request: Request):
-    if not PROXY_API_KEY:
-        return
-    got = request.headers.get("authorization", "").removeprefix("Bearer ").strip()
-    if got != PROXY_API_KEY:
-        raise HTTPException(401, "invalid api key")
+_require_key = require_bearer_key
 
 
 def _file_obj(openai_id: str, filename: str, size: int, purpose: str, ds_id: str) -> dict:
@@ -42,11 +37,35 @@ async def upload_file(
 ):
     content = await file.read()
     mime = file.content_type or "application/octet-stream"
+    filename = file.filename or "upload"
+
+    if BACKEND == "zai":
+        # No Z.AI upload endpoint wired yet. For text payloads we cache the
+        # decoded bytes locally so the chat routes' inline-text fallback can
+        # splice the file into the prompt. Binary uploads still fail loudly so
+        # callers see why nothing reached the model.
+        try:
+            content.decode("utf-8")
+        except UnicodeDecodeError as e:
+            raise HTTPException(
+                status_code=415,
+                detail=(
+                    "binary file upload is not supported on the Z.AI backend. "
+                    "Send a UTF-8 text file (it will be inlined into the "
+                    "prompt) or switch to BACKEND=deepseek for upstream upload."
+                ),
+            ) from e
+        openai_id = f"file-{uuid.uuid4().hex[:24]}"
+        synthetic_ds_id = f"zai-local-{openai_id}"
+        obj = _file_obj(openai_id, filename, len(content), purpose, synthetic_ds_id)
+        await ds_files.store_mapping(openai_id, obj, content=content)
+        return obj
+
     http = request.app.state.ds._http  # reuse client's http connection pool
-    info = await ds_files.upload(http, file.filename or "upload", content, mime)
+    info = await ds_files.upload(http, filename, content, mime)
 
     openai_id = f"file-{uuid.uuid4().hex[:24]}"
-    obj = _file_obj(openai_id, info.get("file_name", file.filename), info.get("file_size", len(content)), purpose, info["id"])
+    obj = _file_obj(openai_id, info.get("file_name", filename), info.get("file_size", len(content)), purpose, info["id"])
     await ds_files.store_mapping(openai_id, obj, content=content)
     return obj
 

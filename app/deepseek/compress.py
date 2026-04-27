@@ -1,10 +1,14 @@
 """Conversation-prefix compression.
 
 When the flattened history exceeds a token threshold, summarize the oldest
-middle window via a one-off DeepSeek call and replace it with a synthetic
+middle window via a one-off upstream call and replace it with a synthetic
 `user` turn so the prefix stays small. Summaries are cached by the hash of
 the window they replace so the same long conversation doesn't pay the
 summarization cost twice.
+
+Backend-agnostic: the `client` parameter is duck-typed against the surface
+shared by `DeepSeekClient` and `ZaiClient` — `create_session()` and
+`stream_completion(session_id, prompt, parent_message_id, thinking, search)`.
 """
 from __future__ import annotations
 
@@ -12,13 +16,25 @@ import asyncio
 import json
 import logging
 import os
-from typing import TYPE_CHECKING, Any
+import time
+from typing import Any, AsyncIterator, Protocol
 
 from app.config import STATE_DIR
 from app.deepseek.sessions import hash_turns
 
-if TYPE_CHECKING:
-    from app.deepseek.client import DeepSeekClient
+
+class _Streamer(Protocol):
+    async def create_session(self) -> str: ...
+    def stream_completion(
+        self,
+        *,
+        session_id: str,
+        prompt: str,
+        parent_message_id: int | str | None = ...,
+        thinking: bool = ...,
+        search: bool = ...,
+    ) -> AsyncIterator[dict[str, Any]]: ...
+
 
 log = logging.getLogger(__name__)
 
@@ -76,16 +92,18 @@ async def _put_cached(key: str, summary: str) -> None:
         _save(data)
 
 
+_ROLE_TAGS = {"system": "SYSTEM", "user": "USER", "assistant": "ASSISTANT", "tool": "TOOL"}
+
+
 def _format_window(window: list[tuple[str, str]]) -> str:
-    tag = {"system": "SYSTEM", "user": "USER", "assistant": "ASSISTANT", "tool": "TOOL"}
     parts: list[str] = []
     for r, c in window:
-        t = tag.get(r, r.upper())
+        t = _ROLE_TAGS.get(r, r.upper())
         parts.append(f"[{t}]\n{c}\n[/{t}]")
     return "\n\n".join(parts)
 
 
-async def _summarize(client: "DeepSeekClient", window: list[tuple[str, str]]) -> str:
+async def _summarize(client: _Streamer, window: list[tuple[str, str]]) -> str:
     session_id = await client.create_session()
     prompt = f"{_SUMMARY_INSTRUCTION}\n\n{_format_window(window)}"
     chunks: list[str] = []
@@ -104,7 +122,7 @@ async def _summarize(client: "DeepSeekClient", window: list[tuple[str, str]]) ->
 
 
 async def maybe_compress(
-    client: "DeepSeekClient",
+    client: _Streamer,
     turns: list[tuple[str, str]],
     threshold: int | None = None,
 ) -> list[tuple[str, str]]:
@@ -133,7 +151,13 @@ async def maybe_compress(
         key = hash_turns(window)
         summary = await _get_cached(key)
         if summary is None:
+            log.info(
+                "compress: triggering summarization (turns=%d, ~%d tokens, window=%d turns)",
+                len(turns), approx_tokens(turns), len(window),
+            )
+            t0 = time.monotonic()
             summary = await _summarize(client, window)
+            log.info("compress: summarization took %.2fs", time.monotonic() - t0)
             if not summary:
                 log.warning("compress: empty summary, skipping")
                 return turns

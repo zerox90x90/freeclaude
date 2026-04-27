@@ -6,12 +6,12 @@ import time
 import uuid
 from typing import Any, AsyncIterator
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
-from app.config import PROXY_API_KEY
 from app.deepseek.client import DeepSeekClient
+from app.routes.auth import require_bearer_key
 from app.routes.openai_chat import (
     ChatMessage,
     canon_turns,
@@ -27,13 +27,7 @@ from app.tools.structured import structured_system_block
 
 router = APIRouter()
 
-
-def _require_key(request: Request):
-    if not PROXY_API_KEY:
-        return
-    got = request.headers.get("authorization", "").removeprefix("Bearer ").strip()
-    if got != PROXY_API_KEY:
-        raise HTTPException(401, "invalid api key")
+_require_key = require_bearer_key
 
 
 class ResponsesRequest(BaseModel):
@@ -86,13 +80,16 @@ def _response_format_from_text(text: dict | None) -> dict | None:
     return fmt  # already OpenAI response_format shape
 
 
+_JSON_SEPS = (",", ":")
+
+
 def _sse(event: str, data: dict) -> bytes:
-    return f"event: {event}\ndata: {json.dumps(data, separators=(',', ':'))}\n\n".encode()
+    return f"event: {event}\ndata: {json.dumps(data, separators=_JSON_SEPS)}\n\n".encode()
 
 
 @router.post("/v1/responses")
 async def responses(req: ResponsesRequest, request: Request, _: None = Depends(_require_key)):
-    base_model, thinking, search = parse_model(req.model)
+    base_model, thinking, search, mcp_servers = parse_model(req.model)
     # Reasoning override
     if req.reasoning:
         thinking = True
@@ -121,7 +118,7 @@ async def responses(req: ResponsesRequest, request: Request, _: None = Depends(_
         return StreamingResponse(
             _stream_responses(
                 client, session_id, parent_id, turns, prompt, thinking, search,
-                req.model, has_tools, ref_file_ids,
+                req.model, has_tools, ref_file_ids, base_model, mcp_servers,
             ),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
@@ -129,7 +126,7 @@ async def responses(req: ResponsesRequest, request: Request, _: None = Depends(_
     return JSONResponse(
         await _buffered_responses(
             client, session_id, parent_id, turns, prompt, thinking, search,
-            req.model, has_tools, ref_file_ids,
+            req.model, has_tools, ref_file_ids, base_model, mcp_servers,
         )
     )
 
@@ -145,6 +142,8 @@ async def _buffered_responses(
     model: str,
     has_tools: bool,
     ref_file_ids: list[str] | None,
+    base_model: str | None = None,
+    mcp_servers: list[str] | None = None,
 ) -> dict:
     content_parts: list[str] = []
     thinking_parts: list[str] = []
@@ -155,6 +154,7 @@ async def _buffered_responses(
     async for ev in client.stream_completion(
         session_id=session_id, prompt=prompt, parent_message_id=parent_id,
         thinking=thinking, search=search, ref_file_ids=ref_file_ids,
+        model=base_model, mcp_servers=mcp_servers,
     ):
         if ev["type"] == "thinking":
             thinking_parts.append(ev["text"])
@@ -231,6 +231,8 @@ async def _stream_responses(
     model: str,
     has_tools: bool,
     ref_file_ids: list[str] | None,
+    base_model: str | None = None,
+    mcp_servers: list[str] | None = None,
 ) -> AsyncIterator[bytes]:
     resp_id = f"resp_{uuid.uuid4().hex[:24]}"
     yield _sse(
@@ -245,10 +247,23 @@ async def _stream_responses(
     tool_calls: list[dict] = []
     assistant_buf: list[str] = []
 
+    def _text_delta(text: str) -> list[bytes]:
+        """Emit text delta frames, opening the output item on first call."""
+        nonlocal item_added
+        frames: list[bytes] = []
+        if not item_added:
+            frames.append(_sse("response.output_item.added", {"type": "response.output_item.added", "output_index": 0, "item": {"id": item_id, "type": "message", "role": "assistant"}}))
+            item_added = True
+        assistant_buf.append(text)
+        output_text.append(text)
+        frames.append(_sse("response.output_text.delta", {"type": "response.output_text.delta", "item_id": item_id, "output_index": 0, "delta": text}))
+        return frames
+
     try:
         async for ev in client.stream_completion(
             session_id=session_id, prompt=prompt, parent_message_id=parent_id,
             thinking=thinking, search=search, ref_file_ids=ref_file_ids,
+            model=base_model,
         ):
             if ev["type"] == "thinking":
                 yield _sse(
@@ -260,12 +275,8 @@ async def _stream_responses(
                 if parser:
                     for pev in parser.flush():
                         if pev["type"] == "text":
-                            if not item_added:
-                                yield _sse("response.output_item.added", {"type": "response.output_item.added", "output_index": 0, "item": {"id": item_id, "type": "message", "role": "assistant"}})
-                                item_added = True
-                            assistant_buf.append(pev["text"])
-                            output_text.append(pev["text"])
-                            yield _sse("response.output_text.delta", {"type": "response.output_text.delta", "item_id": item_id, "output_index": 0, "delta": pev["text"]})
+                            for frame in _text_delta(pev["text"]):
+                                yield frame
                 if item_added:
                     yield _sse("response.output_text.done", {"type": "response.output_text.done", "item_id": item_id, "text": "".join(output_text)})
                     yield _sse("response.output_item.done", {"type": "response.output_item.done", "output_index": 0, "item": {"id": item_id, "type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "".join(output_text)}]}})
@@ -280,21 +291,13 @@ async def _stream_responses(
                 continue
             text = ev["text"]
             if not parser:
-                if not item_added:
-                    yield _sse("response.output_item.added", {"type": "response.output_item.added", "output_index": 0, "item": {"id": item_id, "type": "message", "role": "assistant"}})
-                    item_added = True
-                assistant_buf.append(text)
-                output_text.append(text)
-                yield _sse("response.output_text.delta", {"type": "response.output_text.delta", "item_id": item_id, "output_index": 0, "delta": text})
+                for frame in _text_delta(text):
+                    yield frame
                 continue
             for pev in parser.feed(text):
                 if pev["type"] == "text":
-                    if not item_added:
-                        yield _sse("response.output_item.added", {"type": "response.output_item.added", "output_index": 0, "item": {"id": item_id, "type": "message", "role": "assistant"}})
-                        item_added = True
-                    assistant_buf.append(pev["text"])
-                    output_text.append(pev["text"])
-                    yield _sse("response.output_text.delta", {"type": "response.output_text.delta", "item_id": item_id, "output_index": 0, "delta": pev["text"]})
+                    for frame in _text_delta(pev["text"]):
+                        yield frame
                 elif pev["type"] == "tool_call":
                     tool_calls.append(pev)
     except Exception as e:

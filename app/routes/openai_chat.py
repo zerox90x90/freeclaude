@@ -10,13 +10,14 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
-from app.config import PROXY_API_KEY
+from app.config import BACKEND
+from app.routes.auth import require_bearer_key
 from app.deepseek import files as ds_files
 from app.deepseek import sessions
 from app.deepseek.client import DeepSeekClient
 from app.deepseek.compress import maybe_compress
 from app.tools.inject import normalize_openai_tools, tool_system_block
-from app.tools.parser import ToolCallParser
+from app.tools.parser import CLOSE as TOOL_CLOSE, OPEN as TOOL_OPEN, ToolCallParser, serialize_tool_calls
 from app.tools.prune import prune_tool_result
 from app.tools.structured import structured_system_block, validate_structured
 
@@ -25,12 +26,7 @@ router = APIRouter()
 
 # ---- auth ----
 
-def _require_key(request: Request):
-    if not PROXY_API_KEY:
-        return
-    got = request.headers.get("authorization", "").removeprefix("Bearer ").strip()
-    if got != PROXY_API_KEY:
-        raise HTTPException(401, "invalid api key")
+_require_key = require_bearer_key
 
 
 # ---- schema ----
@@ -66,18 +62,61 @@ class ChatRequest(BaseModel):
 
 # ---- model suffix parser ----
 
-def parse_model(name: str) -> tuple[str, bool, bool]:
-    """Return (base, thinking, search). Suffix :search enables web search.
-    Base: deepseek-reasoner -> thinking=True; deepseek-chat -> thinking=False.
-    Unknown names default to deepseek-chat behavior.
+# MCP suffix -> Z.AI MCP server id (see /api/models meta.mcpServerIds)
+_MCP_SUFFIXES: dict[str, str] = {
+    "deepresearch":  "deep-research",
+    "advsearch":     "advanced-search",
+    "deepwebsearch": "deep-web-search",
+    "imagesearch":   "image-search",
+    "ppt":           "ppt-maker",
+    "vibecoding":    "vibe-coding",
+}
+
+
+def parse_model(name: str) -> tuple[str, bool, bool, list[str]]:
+    """Return (base, thinking, search, mcp_servers). Suffixes compose:
+    `:search`, `:think`, `:nothink`, and Z.AI MCP aliases (`:deepresearch`,
+    `:advsearch`, `:deepwebsearch`, `:imagesearch`, `:ppt`, `:vibecoding`).
+
+    DeepSeek: `deepseek-reasoner` implies thinking=True; `deepseek-chat` off.
+               MCP suffixes are accepted but ignored.
+    Z.AI:     thinking defaults on for reasoning-capable GLM-5 variants;
+              `:nothink` disables it. `:search` toggles upstream web search.
     """
     search = False
-    if name.endswith(":search"):
-        search = True
-        name = name[: -len(":search")]
-    thinking = name == "deepseek-reasoner"
-    base = name if name in ("deepseek-chat", "deepseek-reasoner") else "deepseek-chat"
-    return base, thinking, search
+    force_think: bool | None = None
+    mcp_servers: list[str] = []
+    # Parse trailing :suffixes (order-independent within the trailing run)
+    while ":" in name:
+        base, _, suffix = name.rpartition(":")
+        s = suffix.lower()
+        if s == "search":
+            search = True
+        elif s == "think":
+            force_think = True
+        elif s == "nothink":
+            force_think = False
+        elif s in _MCP_SUFFIXES:
+            srv = _MCP_SUFFIXES[s]
+            if srv not in mcp_servers:
+                mcp_servers.append(srv)
+        else:
+            break
+        name = base
+
+    if BACKEND == "zai":
+        lname = name.lower()
+        thinking_default = lname in (
+            "glm-5.1", "glm-5-1", "glm-5", "glm-5-turbo",
+        )
+        thinking = force_think if force_think is not None else thinking_default
+        base = name if name else "glm-5-turbo"
+    else:
+        thinking_default = name == "deepseek-reasoner"
+        thinking = force_think if force_think is not None else thinking_default
+        base = name if name in ("deepseek-chat", "deepseek-reasoner") else "deepseek-chat"
+        mcp_servers = []  # DeepSeek backend has no MCP server concept
+    return base, thinking, search, mcp_servers
 
 
 # ---- message flattening ----
@@ -137,9 +176,9 @@ def canon_turns(messages: list[ChatMessage]) -> list[tuple[str, str]]:
                 else:
                     args_obj = args
                 extras.append(
-                    f"<tool_call>\n"
+                    f"{TOOL_OPEN}\n"
                     f"{json.dumps({'name': name, 'arguments': args_obj})}"
-                    f"\n</tool_call>"
+                    f"\n{TOOL_CLOSE}"
                 )
         if extras:
             text = (text + "\n" + "\n".join(extras)).strip()
@@ -149,6 +188,9 @@ def canon_turns(messages: list[ChatMessage]) -> list[tuple[str, str]]:
         if text:
             out.append((m.role, text))
     return out
+
+
+_ROLE_TAGS = {"system": "SYSTEM", "user": "USER", "assistant": "ASSISTANT", "tool": "TOOL"}
 
 
 def flatten_prefix(turns: list[tuple[str, str]]) -> str:
@@ -161,10 +203,9 @@ def flatten_prefix(turns: list[tuple[str, str]]) -> str:
     """
     if not turns:
         return ""
-    tag = {"system": "SYSTEM", "user": "USER", "assistant": "ASSISTANT", "tool": "TOOL"}
     parts = []
     for r, c in turns:
-        t = tag.get(r, r.upper())
+        t = _ROLE_TAGS.get(r, r.upper())
         parts.append(f"[{t}]\n{c}\n[/{t}]")
     return "\n\n".join(parts)
 
@@ -207,9 +248,12 @@ async def inline_file_text(messages: list[ChatMessage]) -> str:
 
 # ---- OpenAI SSE frame helpers ----
 
+_JSON_SEPS = (",", ":")
+
+
 def _sse(data: dict | str) -> bytes:
     if isinstance(data, dict):
-        data = json.dumps(data, separators=(",", ":"))
+        data = json.dumps(data, separators=_JSON_SEPS)
     return f"data: {data}\n\n".encode()
 
 
@@ -242,20 +286,29 @@ def _usage(prompt_tokens: int, completion_tokens: int, reasoning_tokens: int = 0
 
 @router.get("/v1/models")
 def list_models(_: None = Depends(_require_key)):
-    ids = (
-        "deepseek-chat",
-        "deepseek-reasoner",
-        "deepseek-chat:search",
-        "deepseek-reasoner:search",
-    )
-    return {"object": "list", "data": [{"id": i, "object": "model", "owned_by": "deepseek"} for i in ids]}
+    if BACKEND == "zai":
+        ids = (
+            "glm-5.1", "glm-5-turbo", "glm-5v-turbo",
+            "glm-5.1:search", "glm-5-turbo:search",
+            "glm-5.1:nothink", "glm-5-turbo:nothink",
+            "glm-5.1:deepresearch", "glm-5.1:advsearch",
+            "glm-5.1:search:deepresearch",
+        )
+        owner = "z.ai"
+    else:
+        ids = (
+            "deepseek-chat", "deepseek-reasoner",
+            "deepseek-chat:search", "deepseek-reasoner:search",
+        )
+        owner = "deepseek"
+    return {"object": "list", "data": [{"id": i, "object": "model", "owned_by": owner} for i in ids]}
 
 
 async def resolve_session(
     client: DeepSeekClient,
     turns: list[tuple[str, str]],
     alias: str | None = None,
-) -> tuple[str, int | None, str]:
+) -> tuple[str, int | str | None, str]:
     """Return (session_id, parent_message_id, prompt_to_send).
 
     If the entire history except the trailing user turn matches a cached
@@ -305,7 +358,7 @@ async def resolve_session(
 
 @router.post("/v1/chat/completions")
 async def chat_completions(req: ChatRequest, request: Request, _: None = Depends(_require_key)):
-    model, thinking, search = parse_model(req.model)
+    model, thinking, search, mcp_servers = parse_model(req.model)
     # Explicit thinking param overrides model suffix
     if req.thinking:
         t = req.thinking.get("type")
@@ -370,6 +423,7 @@ async def chat_completions(req: ChatRequest, request: Request, _: None = Depends
                 client, session_id, parent_id, turns, prompt, thinking, search, req.model,
                 has_tools=has_tools, response_format=req.response_format,
                 ref_file_ids=ref_file_ids, include_usage=include_usage,
+                base_model=model, mcp_servers=mcp_servers,
             ),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
@@ -379,6 +433,7 @@ async def chat_completions(req: ChatRequest, request: Request, _: None = Depends
             client, session_id, parent_id, turns, prompt, thinking, search, req.model,
             has_tools=has_tools, response_format=req.response_format,
             ref_file_ids=ref_file_ids,
+            base_model=model, mcp_servers=mcp_servers,
         )
     )
 
@@ -386,7 +441,7 @@ async def chat_completions(req: ChatRequest, request: Request, _: None = Depends
 async def _stream(
     client: DeepSeekClient,
     session_id: str,
-    parent_id: int | None,
+    parent_id: int | str | None,
     turns: list[tuple[str, str]],
     prompt: str,
     thinking: bool,
@@ -396,6 +451,8 @@ async def _stream(
     response_format: dict | None = None,
     ref_file_ids: list[str] | None = None,
     include_usage: bool = False,
+    base_model: str | None = None,
+    mcp_servers: list[str] | None = None,
 ) -> AsyncIterator[bytes]:
     id_ = f"chatcmpl-{uuid.uuid4().hex}"
     yield _sse(_chunk(id_, model, {"role": "assistant", "content": ""}))
@@ -405,6 +462,7 @@ async def _stream(
     tool_calls_emitted: list[dict] = []
     assistant_buf: list[str] = []
     final_msg_id: int | None = None
+    final_session_id: str = session_id
 
     try:
         async for ev in client.stream_completion(
@@ -414,12 +472,15 @@ async def _stream(
             thinking=thinking,
             search=search,
             ref_file_ids=ref_file_ids,
+            model=base_model,
+            mcp_servers=mcp_servers,
         ):
             if ev["type"] == "thinking":
                 yield _sse(_chunk(id_, model, {"reasoning_content": ev["text"]}))
                 continue
             if ev["type"] == "done":
                 final_msg_id = ev["message_id"]
+                final_session_id = ev.get("session_id") or session_id
                 if parser:
                     for pev in parser.flush():
                         if pev["type"] == "text":
@@ -472,14 +533,15 @@ async def _stream(
     except Exception as e:
         yield _sse({"error": {"message": str(e), "type": "upstream_error"}})
     else:
-        await _cache_turn(turns, "".join(assistant_buf), session_id, final_msg_id)
+        cache_text = build_cache_text("".join(assistant_buf), tool_calls_emitted)
+        await _cache_turn(turns, cache_text, final_session_id, final_msg_id)
     yield _sse("[DONE]")
 
 
 async def _buffered(
     client: DeepSeekClient,
     session_id: str,
-    parent_id: int | None,
+    parent_id: int | str | None,
     turns: list[tuple[str, str]],
     prompt: str,
     thinking: bool,
@@ -488,23 +550,28 @@ async def _buffered(
     has_tools: bool = False,
     response_format: dict | None = None,
     ref_file_ids: list[str] | None = None,
+    base_model: str | None = None,
+    mcp_servers: list[str] | None = None,
 ) -> dict:
     content_parts: list[str] = []
     thinking_parts: list[str] = []
     tool_calls: list[dict] = []
-    message_id: int | None = None
+    parser_tool_calls: list[dict] = []
+    message_id: int | str | None = None
     finish_reason = "stop"
+    final_session_id: str = session_id
 
     parser = ToolCallParser() if has_tools else None
 
     async def process(ev: dict):
-        nonlocal message_id, finish_reason
+        nonlocal message_id, finish_reason, final_session_id
         if ev["type"] == "thinking":
             thinking_parts.append(ev["text"])
             return
         if ev["type"] == "done":
             message_id = ev["message_id"]
             finish_reason = ev["finish_reason"]
+            final_session_id = ev.get("session_id") or session_id
             return
         if ev["type"] != "content":
             return
@@ -516,6 +583,7 @@ async def _buffered(
             if pev["type"] == "text":
                 content_parts.append(pev["text"])
             elif pev["type"] == "tool_call":
+                parser_tool_calls.append(pev)
                 tool_calls.append(
                     {
                         "id": pev["id"],
@@ -534,6 +602,8 @@ async def _buffered(
         thinking=thinking,
         search=search,
         ref_file_ids=ref_file_ids,
+        model=base_model,
+        mcp_servers=mcp_servers,
     ):
         await process(ev)
         if ev["type"] == "done":
@@ -567,11 +637,12 @@ async def _buffered(
                     content_parts.append(ev["text"])
                 elif ev["type"] == "done":
                     message_id = ev["message_id"]
-                    session_id = retry_sid
+                    final_session_id = ev.get("session_id") or retry_sid
                     break
             content = "".join(content_parts)
 
-    await _cache_turn(turns, content, session_id, message_id)
+    cache_text = build_cache_text(content, parser_tool_calls)
+    await _cache_turn(turns, cache_text, final_session_id, message_id)
 
     msg: dict[str, Any] = {"role": "assistant", "content": content or None}
     if thinking_parts:
@@ -595,16 +666,28 @@ async def _buffered(
     }
 
 
+def build_cache_text(content: str, tool_calls: list[dict]) -> str:
+    """Assemble the assistant cache key from text content + serialized tool calls."""
+    return "\n".join(
+        p for p in [content, serialize_tool_calls(tool_calls)] if p
+    ).strip()
+
+
 async def _cache_turn(
     turns: list[tuple[str, str]],
     assistant_text: str,
     session_id: str,
-    message_id: int | None,
+    message_id: int | str | None,
 ) -> None:
     """Cache post-completion state so the client's next turn (which will include
     this assistant reply in its messages array) can resume without replaying.
+
+    `assistant_text` must equal what the client will reflatten — text plus the
+    serialized `<tool_call>...</tool_call>` envelopes — so the prefix-hash for
+    the next request matches. Tool-only responses still cache (the empty-text
+    case is normal in agentic loops).
     """
-    if not assistant_text or message_id is None:
+    if message_id is None:
         return
     full = turns + [("assistant", assistant_text)]
     await sessions.put(sessions.hash_turns(full), session_id, message_id)

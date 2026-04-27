@@ -6,23 +6,15 @@ stale ones without editing sessions.json by hand.
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict
 
-from app.config import PROXY_API_KEY
 from app.deepseek import sessions as ds_sessions
+from app.routes.auth import require_any_key
 
 router = APIRouter()
 
-
-def _require_key(request: Request):
-    if not PROXY_API_KEY:
-        return
-    got = request.headers.get("x-api-key") or request.headers.get(
-        "authorization", ""
-    ).removeprefix("Bearer ").strip()
-    if got != PROXY_API_KEY:
-        raise HTTPException(401, "invalid api key")
+_require_key = require_any_key
 
 
 class PinRequest(BaseModel):

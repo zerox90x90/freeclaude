@@ -7,10 +7,15 @@ __pycache__/
 
 # State files — contain credentials and cached session data
 ~/.deepseek-proxy/
+~/.zai-proxy/
 state.json
 sessions.json
 files.json
 summaries.json
+
+# Playwright traffic captures — contain real auth headers/tokens
+probe/zai_continuation_capture.json
+probe/*_capture.json
 
 # Logs
 *.log

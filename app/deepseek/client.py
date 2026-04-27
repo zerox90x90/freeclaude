@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import time
 from typing import Any, AsyncIterator
 
 import httpx
@@ -19,23 +21,27 @@ from app.config import APP_VERSION, BASE_URL
 from app.deepseek import auth
 from app.deepseek.pow import solve_challenge
 
+log = logging.getLogger(__name__)
+
+
+_STATIC_HEADERS: dict[str, str] = {
+    "content-type": "application/json",
+    "x-app-version": APP_VERSION,
+    "x-client-platform": "web",
+    "x-client-version": "1.0.0-always",
+    "user-agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/131.0.0.0 Safari/537.36"
+    ),
+    "accept": "*/*",
+    "origin": "https://chat.deepseek.com",
+    "referer": "https://chat.deepseek.com/",
+}
+
 
 def _headers(token: str, pow_resp: str | None = None) -> dict[str, str]:
-    h = {
-        "authorization": f"Bearer {token}",
-        "content-type": "application/json",
-        "x-app-version": APP_VERSION,
-        "x-client-platform": "web",
-        "x-client-version": "1.0.0-always",
-        "user-agent": (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/131.0.0.0 Safari/537.36"
-        ),
-        "accept": "*/*",
-        "origin": "https://chat.deepseek.com",
-        "referer": "https://chat.deepseek.com/",
-    }
+    h = {**_STATIC_HEADERS, "authorization": f"Bearer {token}"}
     if pow_resp:
         h["x-ds-pow-response"] = pow_resp
     return h
@@ -43,7 +49,9 @@ def _headers(token: str, pow_resp: str | None = None) -> dict[str, str]:
 
 class DeepSeekClient:
     def __init__(self):
-        self._http = httpx.AsyncClient(http2=True, timeout=httpx.Timeout(120.0, connect=15.0))
+        # Long read timeout: reasoner streams can pause >2min between deltas
+        # while thinking. The original 120s killed those mid-stream.
+        self._http = httpx.AsyncClient(http2=True, timeout=httpx.Timeout(600.0, connect=15.0))
 
     async def aclose(self):
         await self._http.aclose()
@@ -87,6 +95,7 @@ class DeepSeekClient:
         return biz["id"]
 
     async def _pow(self, target: str) -> str:
+        t0 = time.monotonic()
         r = await self._post("/chat/create_pow_challenge", {"target_path": target})
         r.raise_for_status()
         body = r.json()
@@ -95,7 +104,9 @@ class DeepSeekClient:
             raise RuntimeError(f"create_pow failed: {body}")
         challenge = biz["challenge"]
         challenge["target_path"] = target
-        return solve_challenge(challenge)
+        resp = solve_challenge(challenge)
+        log.info("deepseek pow %s solved in %.2fs", target, time.monotonic() - t0)
+        return resp
 
     async def stream_completion(
         self,
@@ -106,8 +117,14 @@ class DeepSeekClient:
         thinking: bool = False,
         search: bool = False,
         ref_file_ids: list[str] | None = None,
+        model: str | None = None,  # unused; kept for backend parity
+        mcp_servers: list[str] | None = None,  # unused; Z.AI-only
     ) -> AsyncIterator[dict[str, Any]]:
         target = "/api/v0/chat/completion"
+        log.info(
+            "deepseek stream begin: session=%s prompt_len=%d thinking=%s search=%s ref_files=%d",
+            session_id, len(prompt or ""), thinking, search, len(ref_file_ids or []),
+        )
         pow_resp = await self._pow(target)
         state = await self._state()
         body = {
@@ -138,9 +155,25 @@ class DeepSeekClient:
                             f"completion HTTP {r.status_code}: {body_bytes.decode(errors='replace')[:300]}"
                         )
                     else:
+                        first_byte_at: float | None = None
+                        post_t0 = time.monotonic()
                         async for ev in _parse_stream(r):
+                            if first_byte_at is None:
+                                first_byte_at = time.monotonic()
+                                log.info(
+                                    "deepseek first event after %.2fs",
+                                    first_byte_at - post_t0,
+                                )
                             yielded_any = True
+                            # Echo the upstream session_id on done so the
+                            # routes layer can treat both backends uniformly.
+                            if ev.get("type") == "done" and "session_id" not in ev:
+                                ev = {**ev, "session_id": session_id}
                             yield ev
+                        log.info(
+                            "deepseek stream complete in %.2fs",
+                            time.monotonic() - post_t0,
+                        )
                         return
             except RuntimeError as e:
                 msg = str(e)
